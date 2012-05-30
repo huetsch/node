@@ -201,4 +201,14 @@ void uv__udp_watcher_stop(uv_udp_t* handle, ev_io* w);
 /* fs */
 void uv__fs_event_destroy(uv_fs_event_t* handle);
 
+#if __linux__
+void uv__inotify_loop_init(uv_loop_t* loop);
+void uv__inotify_loop_delete(uv_loop_t* loop);
+# define uv__loop_platform_init(loop)   uv__inotify_loop_init(loop)
+# define uv__loop_platform_delete(loop) uv__inotify_loop_delete(loop)
+#else
+# define uv__loop_platform_init(loop)
+# define uv__loop_platform_delete(loop)
+#endif
+
 #endif /* UV_UNIX_INTERNAL_H_ */

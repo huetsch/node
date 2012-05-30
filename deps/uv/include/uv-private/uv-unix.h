@@ -57,7 +57,15 @@ typedef uid_t uv_uid_t;
 typedef void* uv_lib_t;
 #define UV_DYNAMIC /* empty */
 
-#if defined(PORT_SOURCE_FILE)
+#if __linux__
+# define UV_LOOP_PRIVATE_PLATFORM_FIELDS              \
+  /* RB_HEAD(uv__inotify_watchers, uv_fs_event_s) */  \
+  struct uv__inotify_watchers {                       \
+    struct uv_fs_event_s* rbh_root;                   \
+  } inotify_watchers;                                 \
+  ev_io inotify_read_watcher;                         \
+  int inotify_fd;
+#elif defined(PORT_SOURCE_FILE)
 # define UV_LOOP_PRIVATE_PLATFORM_FIELDS              \
   ev_io fs_event_watcher;                             \
   int fs_fd;
@@ -204,9 +212,16 @@ typedef void* uv_lib_t;
 /* UV_FS_EVENT_PRIVATE_FIELDS */
 #if defined(__linux__)
 
-#define UV_FS_EVENT_PRIVATE_FIELDS \
-  ev_io read_watcher; \
-  uv_fs_event_cb cb; \
+#define UV_FS_EVENT_PRIVATE_FIELDS    \
+  /* RB_ENTRY(fs_event_s) node; */    \
+  struct {                            \
+    struct uv_fs_event_s* rbe_left;   \
+    struct uv_fs_event_s* rbe_right;  \
+    struct uv_fs_event_s* rbe_parent; \
+    int rbe_color;                    \
+  } node;                             \
+  ev_io read_watcher;                 \
+  uv_fs_event_cb cb;
 
 #elif (defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1060) \
   || defined(__FreeBSD__) \

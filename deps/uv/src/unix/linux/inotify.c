@@ -19,21 +19,19 @@
  */
 
 #include "uv.h"
-#include "internal.h"
+#include "tree.h"
+#include "../internal.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
 
-#include <sys/sysinfo.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <time.h>
-
-#undef NANOSEC
-#define NANOSEC 1000000000
 
 #undef HAVE_INOTIFY_INIT
 #undef HAVE_INOTIFY_INIT1
@@ -127,86 +125,109 @@ static char* basename_r(const char* path) {
 }
 
 
-/*
- * There's probably some way to get time from Linux than gettimeofday(). What
- * it is, I don't know.
- */
-uint64_t uv_hrtime() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (ts.tv_sec * NANOSEC + ts.tv_nsec);
-}
-
-void uv_loadavg(double avg[3]) {
-  struct sysinfo info;
-
-  if (sysinfo(&info) < 0) return;
-
-  avg[0] = (double) info.loads[0] / 65536.0;
-  avg[1] = (double) info.loads[1] / 65536.0;
-  avg[2] = (double) info.loads[2] / 65536.0;
-}
-
-
-int uv_exepath(char* buffer, size_t* size) {
-  if (!buffer || !size) {
-    return -1;
-  }
-
-  *size = readlink("/proc/self/exe", buffer, *size - 1);
-  if (*size <= 0) return -1;
-  buffer[*size] = '\0';
+static int compare_watchers(const uv_fs_event_t* a, const uv_fs_event_t* b) {
+  if (a->fd < b->fd) return -1;
+  if (a->fd > b->fd) return 1;
   return 0;
 }
 
-uint64_t uv_get_free_memory(void) {
-  return (uint64_t) sysconf(_SC_PAGESIZE) * sysconf(_SC_AVPHYS_PAGES);
+
+RB_GENERATE_INTERNAL(uv__inotify_watchers, uv_fs_event_s, node, compare_watchers,
+  inline static __attribute__((unused)))
+
+
+void uv__inotify_loop_init(uv_loop_t* loop) {
+  RB_INIT(&loop->inotify_watchers);
+  loop->inotify_fd = -1;
 }
 
-uint64_t uv_get_total_memory(void) {
-  return (uint64_t) sysconf(_SC_PAGESIZE) * sysconf(_SC_PHYS_PAGES);
+
+void uv__inotify_loop_delete(uv_loop_t* loop) {
+  if (loop->inotify_fd == -1) return;
+  ev_io_stop(loop->ev, &loop->inotify_read_watcher);
+  close(loop->inotify_fd);
+  loop->inotify_fd = -1;
 }
+
 
 #if HAVE_INOTIFY_INIT || HAVE_INOTIFY_INIT1
 
-static int new_inotify_fd(void) {
-  int fd;
+static void uv__inotify_read(EV_P_ ev_io* w, int revents);
 
+
+static int new_inotify_fd(void) {
 #if HAVE_INOTIFY_INIT1
-  fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-  if (fd != -1)
-    return fd;
-  if (errno != ENOSYS)
-    return -1;
-#endif
+  return inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+#else
+  int fd;
 
   if ((fd = inotify_init()) == -1)
     return -1;
 
   if (uv__cloexec(fd, 1) || uv__nonblock(fd, 1)) {
     SAVE_ERRNO(uv__close(fd));
-    fd = -1;
+    return -1;
   }
 
   return fd;
+#endif
+}
+
+
+static int init_inotify(uv_loop_t* loop) {
+  if (loop->inotify_fd != -1)
+    return 0;
+
+  loop->inotify_fd = new_inotify_fd();
+  if (loop->inotify_fd == -1) {
+    uv__set_sys_error(loop, errno);
+    return -1;
+  }
+
+  ev_io_init(&loop->inotify_read_watcher,
+             uv__inotify_read,
+             loop->inotify_fd,
+             EV_READ);
+  ev_io_start(loop->ev, &loop->inotify_read_watcher);
+  ev_unref(loop->ev);
+
+  return 0;
+}
+
+
+static void add_watcher(uv_fs_event_t* handle) {
+  RB_INSERT(uv__inotify_watchers, &handle->loop->inotify_watchers, handle);
+}
+
+
+static uv_fs_event_t* find_watcher(uv_loop_t* loop, int wd) {
+  uv_fs_event_t handle;
+  handle.fd = wd;
+  return RB_FIND(uv__inotify_watchers, &loop->inotify_watchers, &handle);
+}
+
+
+static void remove_watcher(uv_fs_event_t* handle) {
+  RB_REMOVE(uv__inotify_watchers, &handle->loop->inotify_watchers, handle);
 }
 
 
 static void uv__inotify_read(EV_P_ ev_io* w, int revents) {
-  struct inotify_event* e;
+  const struct inotify_event* e;
   uv_fs_event_t* handle;
+  uv_loop_t* uv_loop;
   const char* filename;
   ssize_t size;
   int events;
-  char *p;
+  const char *p;
   /* needs to be large enough for sizeof(inotify_event) + strlen(filename) */
   char buf[4096];
 
-  handle = container_of(w, uv_fs_event_t, read_watcher);
+  uv_loop = container_of(w, uv_loop_t, inotify_read_watcher);
 
-  do {
+  while (1) {
     do {
-      size = read(handle->fd, buf, sizeof buf);
+      size = read(uv_loop->inotify_fd, buf, sizeof buf);
     }
     while (size == -1 && errno == EINTR);
 
@@ -219,13 +240,17 @@ static void uv__inotify_read(EV_P_ ev_io* w, int revents) {
 
     /* Now we have one or more inotify_event structs. */
     for (p = buf; p < buf + size; p += sizeof(*e) + e->len) {
-      e = (void*)p;
+      e = (const struct inotify_event*)p;
 
       events = 0;
       if (e->mask & (IN_ATTRIB|IN_MODIFY))
         events |= UV_CHANGE;
       if (e->mask & ~(IN_ATTRIB|IN_MODIFY))
         events |= UV_RENAME;
+
+      handle = find_watcher(uv_loop, e->wd);
+      if (handle == NULL)
+        continue; /* Handle has already been closed. */
 
       /* inotify does not return the filename when monitoring a single file
        * for modifications. Repurpose the filename for API compatibility.
@@ -234,12 +259,8 @@ static void uv__inotify_read(EV_P_ ev_io* w, int revents) {
       filename = e->len ? (const char*) (e + 1) : basename_r(handle->filename);
 
       handle->cb(handle, filename, events, 0);
-
-      if (handle->fd == -1)
-        break;
     }
   }
-  while (handle->fd != -1); /* handle might've been closed by callback */
 }
 
 
@@ -249,56 +270,44 @@ int uv_fs_event_init(uv_loop_t* loop,
                      uv_fs_event_cb cb,
                      int flags) {
   int events;
-  int fd;
+  int wd;
 
   loop->counters.fs_event_init++;
 
   /* We don't support any flags yet. */
   assert(!flags);
 
-  /*
-   * TODO share a single inotify fd across the event loop?
-   * We'll run into fs.inotify.max_user_instances if we
-   * keep creating new inotify fds.
-   */
-  if ((fd = new_inotify_fd()) == -1) {
-    uv__set_sys_error(loop, errno);
-    return -1;
-  }
+  if (init_inotify(loop)) return -1;
 
   events = IN_ATTRIB
          | IN_CREATE
          | IN_MODIFY
          | IN_DELETE
          | IN_DELETE_SELF
-         | IN_MOVE_SELF
          | IN_MOVED_FROM
          | IN_MOVED_TO;
 
-  if (inotify_add_watch(fd, filename, events) == -1) {
+  wd = inotify_add_watch(loop->inotify_fd, filename, events);
+  if (wd == -1) {
     uv__set_sys_error(loop, errno);
-    uv__close(fd);
     return -1;
   }
 
   uv__handle_init(loop, (uv_handle_t*)handle, UV_FS_EVENT);
-  handle->filename = strdup(filename); /* this should go! */
+  handle->filename = strdup(filename);
   handle->cb = cb;
-  handle->fd = fd;
-
-  ev_io_init(&handle->read_watcher, uv__inotify_read, fd, EV_READ);
-  ev_io_start(loop->ev, &handle->read_watcher);
-  ev_unref(loop->ev);
+  handle->fd = wd;
+  add_watcher(handle);
 
   return 0;
 }
 
 
 void uv__fs_event_destroy(uv_fs_event_t* handle) {
-  ev_ref(handle->loop->ev);
-  ev_io_stop(handle->loop->ev, &handle->read_watcher);
-  uv__close(handle->fd);
+  inotify_rm_watch(handle->loop->inotify_fd, handle->fd);
+  remove_watcher(handle);
   handle->fd = -1;
+
   free(handle->filename);
   handle->filename = NULL;
 }
@@ -317,8 +326,7 @@ int uv_fs_event_init(uv_loop_t* loop,
 
 
 void uv__fs_event_destroy(uv_fs_event_t* handle) {
-  assert(0 && "unreachable");
-  abort();
+  UNREACHABLE();
 }
 
 #endif /* HAVE_INOTIFY_INIT || HAVE_INOTIFY_INIT1 */

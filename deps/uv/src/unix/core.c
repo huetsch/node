@@ -151,6 +151,7 @@ uv_loop_t* uv_loop_new(void) {
   uv_loop_t* loop = calloc(1, sizeof(uv_loop_t));
   loop->ev = ev_loop_new(0);
   ev_set_userdata(loop->ev, loop);
+  uv__loop_platform_init(loop);
 #if HAVE_PORTS_FS
   loop->fs_fd = -1;
 #endif
@@ -161,9 +162,10 @@ uv_loop_t* uv_loop_new(void) {
 void uv_loop_delete(uv_loop_t* loop) {
   uv_ares_destroy(loop, loop->channel);
   ev_loop_destroy(loop->ev);
+  uv__loop_platform_delete(loop);
 
 #ifndef NDEBUG
-  memset(loop, 0, sizeof *loop);
+  memset(loop, -1, sizeof *loop);
 #endif
 
 #if HAVE_PORTS_FS
